@@ -2812,6 +2812,181 @@ test_mongoc_uri_srv_allowed_hosts_suffix(void)
 
 // The topology validates polled SRV hosts against a *copy* of the URI, so a
 // copy must enforce srvAllowedHostsSuffix exactly like the original.
+typedef struct {
+   int calls;
+   char last_host[256];
+   bool verdict;      // Returned when `report_error` is false.
+   bool report_error; // Fail with an error message instead of returning `verdict`.
+} srv_host_validator_ctx_t;
+
+static bool
+_srv_host_validator(const char *host, void *user_data, bson_error_t *error)
+{
+   srv_host_validator_ctx_t *ctx = user_data;
+   ctx->calls++;
+   bson_strncpy(ctx->last_host, host, sizeof(ctx->last_host));
+
+   if (ctx->report_error) {
+      bson_set_error(error, MONGOC_ERROR_STREAM, MONGOC_ERROR_STREAM_NAME_RESOLUTION, "validator exploded");
+      return false;
+   }
+
+   return ctx->verdict;
+}
+
+// Initial DNS Seedlist Discovery prose tests 5-9 and 13: srvHostValidator.
+static void
+test_mongoc_uri_srv_host_validator(void)
+{
+   bson_error_t error;
+   srv_host_validator_ctx_t ctx = {0};
+
+   // Prose test 5: a validator that returns true replaces the default verification entirely.
+   {
+      mongoc_uri_t *uri = mongoc_uri_new_with_error("mongodb+srv://blogs.mongodb.com", &error);
+      ASSERT_OR_PRINT(uri, error);
+      ctx = (srv_host_validator_ctx_t){.verdict = true};
+      ASSERT_OR_PRINT(mongoc_uri_set_srv_host_validator(uri, _srv_host_validator, &ctx, &error), error);
+
+      // Does not share the SRV's domain name.
+      ASSERT_OR_PRINT(mongoc_uri_upsert_host_and_port(uri, "blogs.evil.com:27017", &error), error);
+      ASSERT(mongoc_uri_get_hosts(uri));
+      ASSERT_CMPSTR(mongoc_uri_get_hosts(uri)->host, "blogs.evil.com");
+      ASSERT_CMPINT(ctx.calls, ==, 1);
+
+      mongoc_uri_destroy(uri);
+   }
+
+   // Prose test 6: a validator that returns false rejects a host the default verification would accept.
+   {
+      mongoc_uri_t *uri = mongoc_uri_new_with_error("mongodb+srv://blogs.mongodb.com", &error);
+      ASSERT_OR_PRINT(uri, error);
+      ctx = (srv_host_validator_ctx_t){.verdict = false};
+      ASSERT_OR_PRINT(mongoc_uri_set_srv_host_validator(uri, _srv_host_validator, &ctx, &error), error);
+
+      ASSERT(!mongoc_uri_upsert_host_and_port(uri, "cluster.mongodb.com:27017", &error));
+      ASSERT_ERROR_CONTAINS(
+         error, MONGOC_ERROR_STREAM, MONGOC_ERROR_STREAM_NAME_RESOLUTION, "rejected by srvHostValidator");
+      ASSERT(!mongoc_uri_get_hosts(uri));
+
+      mongoc_uri_destroy(uri);
+   }
+
+   // Prose test 7: the validator receives the normalized host name.
+   {
+      mongoc_uri_t *uri = mongoc_uri_new_with_error("mongodb+srv://blogs.mongodb.com", &error);
+      ASSERT_OR_PRINT(uri, error);
+      ctx = (srv_host_validator_ctx_t){.verdict = true};
+      ASSERT_OR_PRINT(mongoc_uri_set_srv_host_validator(uri, _srv_host_validator, &ctx, &error), error);
+
+      ASSERT_OR_PRINT(mongoc_uri_validate_srv_result(uri, "CLUSTER.MONGODB.COM.", &error), error);
+      ASSERT_CMPSTR(ctx.last_host, "cluster.mongodb.com");
+
+      mongoc_uri_destroy(uri);
+   }
+
+   // Prose test 8: an error reported by the validator is retained in the driver's error.
+   {
+      mongoc_uri_t *uri = mongoc_uri_new_with_error("mongodb+srv://blogs.mongodb.com", &error);
+      ASSERT_OR_PRINT(uri, error);
+      ctx = (srv_host_validator_ctx_t){.report_error = true};
+      ASSERT_OR_PRINT(mongoc_uri_set_srv_host_validator(uri, _srv_host_validator, &ctx, &error), error);
+
+      ASSERT(!mongoc_uri_upsert_host_and_port(uri, "cluster.mongodb.com:27017", &error));
+      ASSERT_ERROR_CONTAINS(error, MONGOC_ERROR_STREAM, MONGOC_ERROR_STREAM_NAME_RESOLUTION, "validator exploded");
+
+      mongoc_uri_destroy(uri);
+   }
+
+   // Prose test 9: srvAllowedHostsSuffix and srvHostValidator are mutually exclusive (suffix set first).
+   {
+      mongoc_uri_t *uri =
+         mongoc_uri_new_with_error("mongodb+srv://blogs.mongodb.com/?srvAllowedHostsSuffix=.mongodb.com", &error);
+      ASSERT_OR_PRINT(uri, error);
+      ctx = (srv_host_validator_ctx_t){.verdict = true};
+
+      ASSERT(!mongoc_uri_set_srv_host_validator(uri, _srv_host_validator, &ctx, &error));
+      ASSERT_ERROR_CONTAINS(error, MONGOC_ERROR_COMMAND, MONGOC_ERROR_COMMAND_INVALID_ARG, "cannot be combined");
+
+      // The failed call left the URI unchanged: the suffix still applies, the validator is not called.
+      ASSERT_OR_PRINT(mongoc_uri_validate_srv_result(uri, "a.mongodb.com", &error), error);
+      ASSERT(!mongoc_uri_validate_srv_result(uri, "a.other.com", &error));
+      ASSERT_CMPINT(ctx.calls, ==, 0);
+
+      mongoc_uri_destroy(uri);
+   }
+
+   // Prose test 9: ... and with the validator set first.
+   {
+      mongoc_uri_t *uri = mongoc_uri_new_with_error("mongodb+srv://blogs.mongodb.com", &error);
+      ASSERT_OR_PRINT(uri, error);
+      ctx = (srv_host_validator_ctx_t){.verdict = true};
+      ASSERT_OR_PRINT(mongoc_uri_set_srv_host_validator(uri, _srv_host_validator, &ctx, &error), error);
+
+      ASSERT(!mongoc_uri_set_option_as_utf8(uri, MONGOC_URI_SRVALLOWEDHOSTSSUFFIX, ".mongodb.com"));
+
+      mongoc_uri_destroy(uri);
+   }
+
+   // Prose test 13: a validator is not accepted with a non-SRV URI.
+   {
+      mongoc_uri_t *uri = mongoc_uri_new_with_error("mongodb://localhost:27017", &error);
+      ASSERT_OR_PRINT(uri, error);
+      ctx = (srv_host_validator_ctx_t){.verdict = true};
+
+      ASSERT(!mongoc_uri_set_srv_host_validator(uri, _srv_host_validator, &ctx, &error));
+      ASSERT_ERROR_CONTAINS(
+         error, MONGOC_ERROR_COMMAND, MONGOC_ERROR_COMMAND_INVALID_ARG, "requires a \"mongodb+srv\" URI");
+
+      mongoc_uri_destroy(uri);
+   }
+
+   // Clearing the validator restores the default verification.
+   {
+      mongoc_uri_t *uri = mongoc_uri_new_with_error("mongodb+srv://blogs.mongodb.com", &error);
+      ASSERT_OR_PRINT(uri, error);
+      ctx = (srv_host_validator_ctx_t){.verdict = true};
+      ASSERT_OR_PRINT(mongoc_uri_set_srv_host_validator(uri, _srv_host_validator, &ctx, &error), error);
+      ASSERT_OR_PRINT(mongoc_uri_validate_srv_result(uri, "blogs.evil.com", &error), error);
+
+      ASSERT_OR_PRINT(mongoc_uri_set_srv_host_validator(uri, NULL, NULL, &error), error);
+      ASSERT(!mongoc_uri_validate_srv_result(uri, "blogs.evil.com", &error));
+      ASSERT_ERROR_CONTAINS(error, MONGOC_ERROR_STREAM, MONGOC_ERROR_STREAM_NAME_RESOLUTION, "must be subdomain");
+
+      mongoc_uri_destroy(uri);
+   }
+}
+
+// A copy keeps the validator, and copying does not invoke it again for the hosts already in the URI.
+static void
+test_mongoc_uri_copy_srv_host_validator(void)
+{
+   bson_error_t error;
+   srv_host_validator_ctx_t ctx = {.verdict = true};
+
+   mongoc_uri_t *uri = mongoc_uri_new_with_error("mongodb+srv://blogs.mongodb.com", &error);
+   ASSERT_OR_PRINT(uri, error);
+   ASSERT_OR_PRINT(mongoc_uri_set_srv_host_validator(uri, _srv_host_validator, &ctx, &error), error);
+
+   // Does not share the SRV's domain name: only the validator accepts it.
+   ASSERT_OR_PRINT(mongoc_uri_upsert_host_and_port(uri, "blogs.evil.com:27017", &error), error);
+   ASSERT_CMPINT(ctx.calls, ==, 1);
+
+   mongoc_uri_t *copy = mongoc_uri_copy(uri);
+   ASSERT(copy);
+   ASSERT_CMPINT(ctx.calls, ==, 1);
+   ASSERT(mongoc_uri_get_hosts(copy));
+   ASSERT_CMPSTR(mongoc_uri_get_hosts(copy)->host_and_port, "blogs.evil.com:27017");
+
+   // The copy validates with the same callback and user data.
+   ASSERT_OR_PRINT(mongoc_uri_validate_srv_result(copy, "other.evil.com", &error), error);
+   ASSERT_CMPINT(ctx.calls, ==, 2);
+   ASSERT_CMPSTR(ctx.last_host, "other.evil.com");
+
+   mongoc_uri_destroy(copy);
+   mongoc_uri_destroy(uri);
+}
+
 static void
 test_mongoc_uri_copy_srv_allowed_hosts_suffix(void)
 {
@@ -3543,6 +3718,8 @@ test_uri_install(TestSuite *suite)
    TestSuite_Add(suite, "/Uri/srv", test_mongoc_uri_srv);
    TestSuite_Add(suite, "/Uri/srv_allowed_hosts_suffix", test_mongoc_uri_srv_allowed_hosts_suffix);
    TestSuite_Add(suite, "/Uri/copy_srv_allowed_hosts_suffix", test_mongoc_uri_copy_srv_allowed_hosts_suffix);
+   TestSuite_Add(suite, "/Uri/srv_host_validator", test_mongoc_uri_srv_host_validator);
+   TestSuite_Add(suite, "/Uri/copy_srv_host_validator", test_mongoc_uri_copy_srv_host_validator);
    TestSuite_Add(suite, "/Uri/punycode", test_mongoc_punycode);
    TestSuite_Add(suite, "/Uri/psl", test_mongoc_psl);
    TestSuite_Add(suite, "/Uri/dns_options", test_mongoc_uri_dns_options);
