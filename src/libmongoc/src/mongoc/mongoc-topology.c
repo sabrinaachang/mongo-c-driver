@@ -520,6 +520,12 @@ mongoc_topology_new(const mongoc_uri_t *uri, bool single_threaded)
 
       /* a mongodb+srv URI. try SRV lookup, if no error then also try TXT */
       prefixed_hostname = bson_strdup_printf("_%s._tcp.%s", mongoc_uri_get_srv_service_name(uri), srv_hostname);
+
+      /* srvHostValidator and srvAllowedHostsSuffix are mutually exclusive. Check before any DNS query is made. */
+      if (!_mongoc_uri_check_srv_validation_options(topology->uri, &topology->scanner->error)) {
+         GOTO(srv_fail);
+      }
+
       if (!topology->rr_resolver(prefixed_hostname,
                                  MONGOC_RR_SRV,
                                  &rr_data,
