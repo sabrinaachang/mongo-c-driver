@@ -58,6 +58,7 @@ API Reference
    mongoc_server_description_t
    mongoc_session_opt_t
    mongoc_socket_t
+   mongoc_srv_host_validator_t
    mongoc_ssl_opt_t
    mongoc_stream_buffered_t
    mongoc_stream_file_t
