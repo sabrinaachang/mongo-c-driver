@@ -74,6 +74,11 @@ mongoc_uri_init_with_srv_host_list(mongoc_uri_t *uri, mongoc_host_list_t *hosts,
 bool
 mongoc_uri_validate_srv_result(const mongoc_uri_t *uri, const char *host, bson_error_t *error);
 
+// Check that the SRV host validation options are compatible with each other and with the URI scheme: a validator
+// requires an SRV URI and excludes `srvAllowedHostsSuffix`.
+bool
+_mongoc_uri_check_srv_validation_options(const mongoc_uri_t *uri, bson_error_t *error);
+
 #ifdef MONGOC_ENABLE_CRYPTO
 void
 _mongoc_uri_init_scram(const mongoc_uri_t *uri, mongoc_scram_t *scram, mongoc_crypto_hash_algorithm_t algo);
