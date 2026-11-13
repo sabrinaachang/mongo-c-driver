@@ -94,6 +94,17 @@ The value must contain at least two "." separated labels, unless it is a single 
 
 This option is only valid with a "mongodb+srv" connection string, and may only be specified at the level of a ``mongoc_client_t``.
 
+The ``srvHostValidator`` Callback
+---------------------------------
+
+As an alternative to ``srvallowedhostssuffix``, a callback can validate each hostname returned by the SRV record. The callback is set with :symbol:`mongoc_uri_set_srv_host_validator`, and replaces the default validation entirely. It is not a connection string option, and cannot be combined with ``srvallowedhostssuffix``.
+
+.. warning::
+
+   **Modifying the default SRV domain name validation can create vulnerabilities.** A validator that accepts hosts it should not allows an attacker who can control DNS responses to direct the driver to a host of their choosing.
+
+See :symbol:`mongoc_srv_host_validator_t` for the callback signature and behavior.
+
 IPv4 and IPv6
 -------------
 
@@ -395,6 +406,7 @@ MONGOC_URI_SAFE                            safe                              {tr
     mongoc_uri_set_read_concern
     mongoc_uri_set_read_prefs_t
     mongoc_uri_set_server_monitoring_mode
+    mongoc_uri_set_srv_host_validator
     mongoc_uri_set_username
     mongoc_uri_set_write_concern
     mongoc_uri_unescape

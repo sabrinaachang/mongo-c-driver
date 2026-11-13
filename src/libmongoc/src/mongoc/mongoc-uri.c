@@ -51,7 +51,9 @@ struct _mongoc_uri_t {
    char *str;
    bool is_srv;
    char srv[BSON_HOST_NAME_MAX + 1];
-   char *srv_allowed_hosts_suffix; // Canonical (dot-prefixed, Punycode, lowercase); NULL when unset.
+   char *srv_allowed_hosts_suffix;                 // Canonical (dot-prefixed, Punycode, lowercase); NULL when unset.
+   mongoc_srv_host_validator_t srv_host_validator; // NULL when unset.
+   void *srv_host_validator_data;                  // Not owned.
    mongoc_host_list_t *hosts;
    char *username; // MongoCredential.username
    char *password; // MongoCredential.password
@@ -175,6 +177,12 @@ static const char *const srv_allowed_hosts_suffix_valid_single_labels[] = {
 static bool
 mongoc_uri_check_srv_allowed_hosts_suffix(mongoc_uri_t *uri, const char *value, bson_error_t *error)
 {
+   // srvAllowedHostsSuffix and srvHostValidator are mutually exclusive.
+   if (uri->srv_host_validator) {
+      MONGOC_URI_ERROR(error, "%s", MONGOC_URI_SRVALLOWEDHOSTSSUFFIX " cannot be combined with srvHostValidator");
+      return false;
+   }
+
    const size_t value_len = strlen(value);
 
    // 1. Strip leading and trailing dots.
@@ -271,7 +279,38 @@ mongoc_uri_validate_srv_result(const mongoc_uri_t *uri, const char *host, bson_e
       return _srv_validation_error(error, host, srv_hostname, "host is not a well-formed domain name");
    }
 
-   if (uri->srv_allowed_hosts_suffix) {
+   if (uri->srv_host_validator) {
+      // srvHostValidator configured: its verdict is the complete validation result. Neither the domainname check, the
+      // domain level requirement, nor srvAllowedHostsSuffix apply.
+      bson_error_t validator_error = {0};
+      const bool valid = uri->srv_host_validator(host_canonical.data, uri->srv_host_validator_data, &validator_error);
+      mstr_destroy(&host_canonical);
+      mstr_destroy(&srv_hostname_canonical);
+
+      if (!valid) {
+         if (validator_error.code != 0 || validator_error.message[0] != '\0') {
+            // The validator reported an error: retain its message.
+            _mongoc_set_error(error,
+                              MONGOC_ERROR_STREAM,
+                              MONGOC_ERROR_STREAM_NAME_RESOLUTION,
+                              "Failed to validate host \"%s\" returned for service \"%s\": "
+                              "srvHostValidator failed: %s",
+                              host,
+                              srv_hostname,
+                              validator_error.message);
+         } else {
+            _mongoc_set_error(error,
+                              MONGOC_ERROR_STREAM,
+                              MONGOC_ERROR_STREAM_NAME_RESOLUTION,
+                              "Invalid host \"%s\" returned for service \"%s\": "
+                              "host rejected by srvHostValidator",
+                              host,
+                              srv_hostname);
+         }
+         return false;
+      }
+      return true;
+   } else if (uri->srv_allowed_hosts_suffix) {
       // srvAllowedHostsSuffix configured: the hostname must end in the
       // (label-aligned, canonical) suffix; the domainname check does not apply.
       if (!mongoc_ends_with(host_canonical.data, uri->srv_allowed_hosts_suffix)) {
@@ -284,10 +323,6 @@ mongoc_uri_validate_srv_result(const mongoc_uri_t *uri, const char *host, bson_e
                                       uri->srv_allowed_hosts_suffix);
       }
    } else {
-      // TODO (CDRIVER-6456): when srvHostValidator is configured, pass the
-      // host_canonical hostname to the validator callback; its verdict is the
-      // complete validation result (no domainname check applies).
-
       // No options configured: host must be a descendant of the service
       // root: if service is "a.foo.co" host can be like "a.foo.co",
       // "b.foo.co", "a.b.foo.co", etc.
@@ -332,6 +367,56 @@ mongoc_uri_validate_srv_result(const mongoc_uri_t *uri, const char *host, bson_e
 
    mstr_destroy(&srv_hostname_canonical);
    mstr_destroy(&host_canonical);
+   return true;
+}
+
+bool
+_mongoc_uri_check_srv_validation_options(const mongoc_uri_t *uri, bson_error_t *error)
+{
+   BSON_ASSERT_PARAM(uri);
+
+   if (!uri->srv_host_validator) {
+      return true;
+   }
+
+   if (!uri->is_srv) {
+      MONGOC_URI_ERROR(error, "%s", "srvHostValidator requires a \"mongodb+srv\" URI");
+      return false;
+   }
+
+   if (uri->srv_allowed_hosts_suffix) {
+      MONGOC_URI_ERROR(
+         error, "%s", "srvHostValidator cannot be combined with the " MONGOC_URI_SRVALLOWEDHOSTSSUFFIX " option");
+      return false;
+   }
+
+   return true;
+}
+
+bool
+mongoc_uri_set_srv_host_validator(mongoc_uri_t *uri,
+                                  mongoc_srv_host_validator_t validator,
+                                  void *user_data,
+                                  bson_error_t *error)
+{
+   BSON_ASSERT_PARAM(uri);
+   BSON_OPTIONAL_PARAM(error);
+
+   bson_error_reset(error);
+
+   // Apply tentatively so the shared check sees the new state; roll back on failure.
+   const mongoc_srv_host_validator_t old_validator = uri->srv_host_validator;
+   void *const old_user_data = uri->srv_host_validator_data;
+
+   uri->srv_host_validator = validator;
+   uri->srv_host_validator_data = validator ? user_data : NULL;
+
+   if (!_mongoc_uri_check_srv_validation_options(uri, error)) {
+      uri->srv_host_validator = old_validator;
+      uri->srv_host_validator_data = old_user_data;
+      return false;
+   }
+
    return true;
 }
 
@@ -2907,7 +2992,6 @@ mongoc_uri_copy(const mongoc_uri_t *uri)
 {
    mongoc_uri_t *copy;
    mongoc_host_list_t *iter;
-   bson_error_t error;
 
    BSON_ASSERT(uri);
 
@@ -2917,6 +3001,8 @@ mongoc_uri_copy(const mongoc_uri_t *uri)
    copy->is_srv = uri->is_srv;
    bson_strncpy(copy->srv, uri->srv, sizeof uri->srv);
    copy->srv_allowed_hosts_suffix = bson_strdup(uri->srv_allowed_hosts_suffix);
+   copy->srv_host_validator = uri->srv_host_validator;
+   copy->srv_host_validator_data = uri->srv_host_validator_data;
    copy->username = bson_strdup(uri->username);
    copy->password = bson_strdup(uri->password);
    copy->database = bson_strdup(uri->database);
@@ -2925,13 +3011,11 @@ mongoc_uri_copy(const mongoc_uri_t *uri)
    copy->read_concern = mongoc_read_concern_copy(uri->read_concern);
    copy->write_concern = mongoc_write_concern_copy(uri->write_concern);
 
+   // The hosts were already validated when they were added to the original. Copy them as is: re-validating would
+   // invoke the srvHostValidator callback every time a URI is copied.
    LL_FOREACH(uri->hosts, iter)
    {
-      if (!mongoc_uri_upsert_host(copy, iter->host, iter->port, &error)) {
-         MONGOC_ERROR("%s", error.message);
-         mongoc_uri_destroy(copy);
-         return NULL;
-      }
+      _mongoc_host_list_upsert(&copy->hosts, iter);
    }
 
    bson_copy_to(&uri->raw, &copy->raw);

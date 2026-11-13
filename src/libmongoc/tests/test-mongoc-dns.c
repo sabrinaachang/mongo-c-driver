@@ -706,6 +706,52 @@ test_srv_polling_normalize_hosts(void *unused)
    mongoc_log_and_monitor_instance_destroy_contents(&log_and_monitor);
 }
 
+static bool
+_polling_srv_host_validator(const char *host, void *user_data, bson_error_t *error)
+{
+   BSON_UNUSED(user_data);
+
+   if (0 == strcmp(host, "explode.example.org")) {
+      bson_set_error(error, MONGOC_ERROR_STREAM, MONGOC_ERROR_STREAM_NAME_RESOLUTION, "validator exploded");
+      return false;
+   }
+
+   return 0 == strcmp(host, "ok.example.org");
+}
+
+// During SRV polling a validator's `false` and a validator's error both skip the host without raising an error.
+static void
+test_srv_polling_host_validator(void *unused)
+{
+   mongoc_topology_description_t td;
+   bson_error_t error;
+   BSON_UNUSED(unused);
+
+   mongoc_log_and_monitor_instance_t log_and_monitor;
+   mongoc_log_and_monitor_instance_init(&log_and_monitor);
+
+   mongoc_topology_description_init(&td, 0);
+   mongoc_uri_t *uri = mongoc_uri_new("mongodb+srv://server.test.com/?tls=true");
+   ASSERT(mongoc_uri_set_srv_host_validator(uri, _polling_srv_host_validator, NULL, &error));
+   capture_logs(true);
+
+   // The validator is the complete verdict: "ok.example.org" would fail the default domainname check but is
+   // accepted. "bad.test.com" would pass the default check but is rejected, and "explode.example.org" reports an error.
+   mongoc_host_list_t *hosts = MAKE_HOSTS("ok.example.org", "bad.test.com", "explode.example.org");
+   mongoc_host_list_t *expected = MAKE_HOSTS("ok.example.org");
+   bool ret = mongoc_topology_apply_scanned_srv_hosts(uri, &td, &log_and_monitor, hosts, &error);
+   ASSERT_OR_PRINT(ret, error);
+   check_topology_description(&td, expected);
+   ASSERT_CAPTURED_LOG("topology", MONGOC_LOG_LEVEL_ERROR, "bad.test.com");
+   ASSERT_CAPTURED_LOG("topology", MONGOC_LOG_LEVEL_ERROR, "validator exploded");
+   _mongoc_host_list_destroy_all(expected);
+   _mongoc_host_list_destroy_all(hosts);
+
+   mongoc_topology_description_cleanup(&td);
+   mongoc_uri_destroy(uri);
+   mongoc_log_and_monitor_instance_destroy_contents(&log_and_monitor);
+}
+
 static void
 test_small_initial_buffer(void *unused)
 {
@@ -1457,6 +1503,12 @@ test_dns_install(TestSuite *suite)
    TestSuite_AddFull(suite,
                      "/initial_dns_seedlist_discovery/srv_polling/normalize_hosts",
                      test_srv_polling_normalize_hosts,
+                     NULL,
+                     NULL,
+                     NULL);
+   TestSuite_AddFull(suite,
+                     "/initial_dns_seedlist_discovery/srv_polling/host_validator",
+                     test_srv_polling_host_validator,
                      NULL,
                      NULL,
                      NULL);

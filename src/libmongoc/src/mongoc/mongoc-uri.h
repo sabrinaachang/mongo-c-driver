@@ -117,6 +117,26 @@ mongoc_uri_get_srv_hostname(const mongoc_uri_t *uri);
 MONGOC_EXPORT(const char *)
 mongoc_uri_get_srv_service_name(const mongoc_uri_t *uri);
 
+/**
+ * @brief Callback to validate a host name returned by an SRV lookup.
+ *
+ * @param host The normalized host name (trailing dot stripped, Punycode, ASCII lowercase). Valid only for the duration
+ * of the call.
+ * @param user_data The pointer given to `mongoc_uri_set_srv_host_validator`.
+ * @param error Optional. To report that validation failed (as opposed to the host being invalid), set this and return
+ * false.
+ * @return true if the host is valid.
+ *
+ * The callback must not block. It may be called from a background thread and must be thread-safe.
+ */
+typedef bool (*mongoc_srv_host_validator_t)(const char *host, void *user_data, bson_error_t *error);
+
+MONGOC_EXPORT(bool)
+mongoc_uri_set_srv_host_validator(mongoc_uri_t *uri,
+                                  mongoc_srv_host_validator_t validator,
+                                  void *user_data,
+                                  bson_error_t *error);
+
 MONGOC_EXPORT(const char *)
 mongoc_uri_get_database(const mongoc_uri_t *uri);
 
